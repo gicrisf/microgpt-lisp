@@ -111,6 +111,23 @@
           (sqrt (* -2.0 (log u1)))
           (cos (* 2.0 pi u2))))))
 
+(defun rmsnorm (x)
+  (let* ((ms (value-div (reduce #'value-add (mapcar (lambda (xi) (value-mul xi xi)) x))
+                        (length x)))
+         (scale (value-pow (value-add ms (make-value 1e-5)) -0.5)))
+    (mapcar (lambda (xi) (value-mul xi scale)) x)))
+
+(defun softmax (logits)
+  (let* ((max-val (reduce #'max logits :key #'data))
+         (exps (mapcar (lambda (v) (value-exp (value-sub v (make-value max-val)))) logits))
+         (total (reduce #'value-add exps)))
+    (mapcar (lambda (e) (value-div e total)) exps)))
+
+(defun linear (x w)
+  "Matrix-vector product: each row of W dotted with X."
+  (loop for wo in w
+        collect (reduce #'value-add (mapcar #'value-mul wo x))))
+
 (defun matrix (nout nin)
   "Create a matrix of value objects with random gaussian init.
 
@@ -120,6 +137,51 @@ Args:
   (loop for _i from 0 below nout
         collect (loop for _j from 0 below nin
                       collect (make-value (random-gauss)))))
+
+(defun gpt (token-id pos-id keys values state-table n-layer n-head head-dim)
+  (let* ((tok-emb (nth token-id (gethash "wte" state-table)))
+         (pos-emb (nth pos-id (gethash "wpe" state-table)))
+         (x (mapcar #'value-add tok-emb pos-emb))
+         (x (rmsnorm x)))
+    (dotimes (li n-layer)
+      (let* ((x-residual x)
+             (x-norm (rmsnorm x))
+             (q (linear x-norm (gethash (format nil "layer~a.attn_wq" li) state-table)))
+             (k (linear x-norm (gethash (format nil "layer~a.attn_wk" li) state-table)))
+             (v (linear x-norm (gethash (format nil "layer~a.attn_wv" li) state-table))))
+        (push k (aref keys li))
+        (push v (aref values li))
+        ;; Reverse because we push (append equivalent)
+        (let ((cached-keys (reverse (aref keys li)))
+              (cached-values (reverse (aref values li)))
+              (x-attn '()))
+          (dotimes (h n-head)
+            (let* ((hs (* h head-dim))
+                   (q-h (subseq q hs (+ hs head-dim)))
+                   (k-h (mapcar (lambda (ki) (subseq ki hs (+ hs head-dim))) cached-keys))
+                   (v-h (mapcar (lambda (vi) (subseq vi hs (+ hs head-dim))) cached-values))
+                   (scale (make-value (expt head-dim 0.5)))
+                   (attn-logits (loop for kt in k-h
+                                      collect (value-div
+                                               (reduce #'value-add (mapcar #'value-mul q-h kt))
+                                               scale)))
+                   (attn-weights (softmax attn-logits))
+                   (head-out (loop for j from 0 below head-dim
+                                   collect (reduce #'value-add
+                                                   (loop for tt from 0 below (length v-h)
+                                                         collect (value-mul (nth tt attn-weights)
+                                                                            (nth j (nth tt v-h))))))))
+              (setf x-attn (append x-attn head-out))))
+          (setf x (linear x-attn (gethash (format nil "layer~a.attn_wo" li) state-table)))
+          (setf x (mapcar #'value-add x x-residual))
+          ;; MLP block
+          (let ((x-residual2 x))
+            (setf x (rmsnorm x))
+            (setf x (linear x (gethash (format nil "layer~a.mlp_fc1" li) state-table)))
+            (setf x (mapcar #'value-relu x))
+            (setf x (linear x (gethash (format nil "layer~a.mlp_fc2" li) state-table)))
+            (setf x (mapcar #'value-add x x-residual2))))))
+    (linear x (gethash "lm_head" state-table))))
 
 (defun main ()
   (let* ((names (let ((n (shuffle (load-names))))
@@ -141,7 +203,6 @@ Args:
          (n-layer 1)  ;; number of layers
          (block-size 16) ;; maximum sequence length
          (head-dim (/ n-embd n-head)) ;; dimension of each head
-         ;; TODO Use the scalar wrapper instead of the random float directly
          (state-table (let ((ht (make-hash-table :test 'equal)))
                         (setf (gethash "wte" ht) (matrix vocab-size n-embd)
                               (gethash "wpe" ht) (matrix block-size n-embd)
@@ -162,12 +223,50 @@ Args:
                                 (dolist (p row)
                                   (vector-push-extend p acc))))
                             state-table)
-                   acc)))
-    ;; Debug print of the state table
-    (maphash (lambda (k v)
-               (format t "~a (~a x ~a):~%" k (length v) (length (first v)))
-               (loop for row in (subseq v 0 (min 3 (length v)))
-                     do (format t "  ~{~,4f ~}~%" (subseq row 0 (min 5 (length row)))))
-               (format t "  ...~%"))
-             state-table)
-    (format t "Num params: ~a~%" (length params))))
+                   acc))
+         (num-params (length params))
+         (learning-rate 0.01)
+         (beta1 0.85)
+         (beta2 0.99)
+         (eps-adam 1e-8)
+         (m (make-array num-params :initial-element 0.0))
+         (v (make-array num-params :initial-element 0.0))
+         (num-steps 1000) ;; number of training steps
+         )
+    (format t "Num params: ~a~%" num-params)
+    (dotimes (step num-steps)
+      ;; Take single document, tokenize it, surround with BOS on both sides
+      (let* ((doc (aref names (mod step (length names))))
+             (tokens (concatenate 'vector
+                       (vector bos)
+                       (map 'vector (lambda (ch) (position ch uchars)) doc)
+                       (vector bos)))
+             (n (min block-size (1- (length tokens))))
+             ;; Fresh KV cache per document
+             (keys (make-array n-layer :initial-element '()))
+             (vals (make-array n-layer :initial-element '()))
+             (losses '()))
+        ;; Forward pass: build computation graph through to the loss
+        (dotimes (pos-id n)
+          (let* ((token-id (aref tokens pos-id))
+                 (target-id (aref tokens (1+ pos-id)))
+                 (logits (gpt token-id pos-id keys vals state-table n-layer n-head head-dim))
+                 (probs (softmax logits))
+                 (loss-t (value-neg (value-log (nth target-id probs)))))
+            (push loss-t losses)))
+        (let ((loss (value-mul (make-value (/ 1.0 n)) (reduce #'value-add losses))))
+          ;; Backward pass
+          (backward loss)
+          ;; Adam optimizer update
+          (let ((lr-t (* learning-rate (- 1 (/ step num-steps)))))
+            (loop for i from 0 below num-params
+                  for p = (aref params i)
+                  do (setf (aref m i) (+ (* beta1 (aref m i))
+                                         (* (- 1 beta1) (grad p))))
+                     (setf (aref v i) (+ (* beta2 (aref v i))
+                                         (* (- 1 beta2) (expt (grad p) 2))))
+                     (let ((m-hat (/ (aref m i) (- 1 (expt beta1 (1+ step)))))
+                           (v-hat (/ (aref v i) (- 1 (expt beta2 (1+ step))))))
+                       (decf (data p) (* lr-t (/ m-hat (+ (expt v-hat 0.5) eps-adam)))))
+                     (setf (grad p) 0)))
+          (format t "step ~4d / ~4d | loss ~,4f~%" (1+ step) num-steps (data loss)))))))
