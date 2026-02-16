@@ -138,6 +138,34 @@ Args:
         collect (loop for _j from 0 below nin
                       collect (make-value (random-gauss)))))
 
+(defun save-state-table (state-table path)
+  "Save state-table weights to file. Stores only the scalar data, not the graph."
+  (with-open-file (out path :direction :output :if-exists :supersede)
+    (maphash (lambda (k mat)
+               (let ((nout (length mat))
+                     (nin (length (first mat))))
+                 (format out "~a ~a ~a~%" k nout nin)
+                 (dolist (row mat)
+                   (format out "~{~f~^ ~}~%" (mapcar #'data row)))))
+             state-table)))
+
+(defun load-state-table (path)
+  "Load state-table weights from file, returning a hash table of Value matrices."
+  (let ((ht (make-hash-table :test 'equal)))
+    (with-open-file (in path :direction :input)
+      (loop for header = (read-line in nil nil)
+            while header
+            do (destructuring-bind (key nout-str nin-str)
+                   (uiop:split-string header :separator " ")
+                 (let ((nout (parse-integer nout-str))
+                       (nin (parse-integer nin-str)))
+                   (setf (gethash key ht)
+                         (loop for _i from 0 below nout
+                               collect (let ((line (read-line in)))
+                                         (mapcar (lambda (s) (make-value (read-from-string s)))
+                                                 (uiop:split-string line :separator " ")))))))))
+    ht))
+
 (defun gpt (token-id pos-id keys values state-table n-layer n-head head-dim)
   (let* ((tok-emb (nth token-id (gethash "wte" state-table)))
          (pos-emb (nth pos-id (gethash "wpe" state-table)))
@@ -183,27 +211,9 @@ Args:
             (setf x (mapcar #'value-add x x-residual2))))))
     (linear x (gethash "lm_head" state-table))))
 
-(defun main ()
-  (let* ((names (let ((n (shuffle (load-names))))
-                  (format t "Names: ~a~%" (length n))
-                  n))
-         ;; Let there be a Tokenizer
-         ;; to translate strings to discrete symbols and back
-         ;;
-         ;; unique characters in the dataset become token ids 0..n-1
-         (uchars (sort (unique-chars names) #'char<))
-         ;; token id for the special Beginning of Sequence (BOS) token
-         (bos (length uchars))
-         ;; total number of unique tokens, +1 is for BOS
-         (vocab-size (let ((v (+ bos 1)))
-                       (format t "Vocab size: ~a~%" v)
-                       v))
-         (n-embd 16)  ;; embedding dimension
-         (n-head 4)   ;; number of attention heads
-         (n-layer 1)  ;; number of layers
-         (block-size 16) ;; maximum sequence length
-         (head-dim (/ n-embd n-head)) ;; dimension of each head
-         (state-table (let ((ht (make-hash-table :test 'equal)))
+(defun train (names uchars bos vocab-size n-embd n-head n-layer block-size head-dim
+              &key (num-steps 1000) (learning-rate 0.01) (save-path nil))
+  (let* ((state-table (let ((ht (make-hash-table :test 'equal)))
                         (setf (gethash "wte" ht) (matrix vocab-size n-embd)
                               (gethash "wpe" ht) (matrix block-size n-embd)
                               (gethash "lm_head" ht) (matrix vocab-size n-embd))
@@ -215,7 +225,6 @@ Args:
                                        (gethash (format nil "layer~a.mlp_fc1" i) ht) (matrix (* 4 n-embd) n-embd)
                                        (gethash (format nil "layer~a.mlp_fc2" i) ht) (matrix n-embd (* 4 n-embd))))
                         ht))
-         ;; Flatten params into a single vector
          (params (let ((acc (make-array 0 :adjustable t :fill-pointer 0)))
                    (maphash (lambda (k mat)
                               (declare (ignore k))
@@ -225,28 +234,22 @@ Args:
                             state-table)
                    acc))
          (num-params (length params))
-         (learning-rate 0.01)
          (beta1 0.85)
          (beta2 0.99)
          (eps-adam 1e-8)
          (m (make-array num-params :initial-element 0.0))
-         (v (make-array num-params :initial-element 0.0))
-         (num-steps 1000) ;; number of training steps
-         )
+         (v (make-array num-params :initial-element 0.0)))
     (format t "Num params: ~a~%" num-params)
     (dotimes (step num-steps)
-      ;; Take single document, tokenize it, surround with BOS on both sides
       (let* ((doc (aref names (mod step (length names))))
              (tokens (concatenate 'vector
                                   (vector bos)
                                   (map 'vector (lambda (ch) (position ch uchars)) doc)
                                   (vector bos)))
              (n (min block-size (1- (length tokens))))
-             ;; Fresh KV cache per document
              (keys (make-array n-layer :initial-element '()))
              (vals (make-array n-layer :initial-element '()))
              (losses '()))
-        ;; Forward pass: build computation graph through to the loss
         (dotimes (pos-id n)
           (let* ((token-id (aref tokens pos-id))
                  (target-id (aref tokens (1+ pos-id)))
@@ -255,9 +258,7 @@ Args:
                  (loss-t (value-neg (value-log (nth target-id probs)))))
             (push loss-t losses)))
         (let ((loss (value-mul (make-value (/ 1.0 n)) (reduce #'value-add losses))))
-          ;; Backward pass
           (backward loss)
-          ;; Adam optimizer update
           (let ((lr-t (* learning-rate (- 1 (/ step num-steps)))))
             (loop for i from 0 below num-params
                   for p = (aref params i)
@@ -270,25 +271,47 @@ Args:
                        (decf (data p) (* lr-t (/ m-hat (+ (expt v-hat 0.5) eps-adam)))))
                      (setf (grad p) 0)))
           (format t "step ~4d / ~4d | loss ~,4f~%" (1+ step) num-steps (data loss)))))
-    ;; Inference: may the model babble back to us
-    (let ((temperature 0.5))
-      (format t "~%--- inference (new, hallucinated names) ---~%")
-      (dotimes (sample-idx 20)
-        (let ((keys (make-array n-layer :initial-element '()))
-              (vals (make-array n-layer :initial-element '()))
-              (token-id bos)
-              (sample '()))
-          (dotimes (pos-id block-size)
-            (let* ((logits (gpt token-id pos-id keys vals state-table n-layer n-head head-dim))
-                   (scaled (mapcar (lambda (l) (value-div l (make-value temperature))) logits))
-                   (probs (softmax scaled))
-                   (weights (mapcar #'data probs))
-                   (r (* (random 1.0) (reduce #'+ weights)))
-                   (chosen (loop for w in weights
-                                 for idx from 0
-                                 summing w into cumul
-                                 when (>= cumul r) return idx)))
-              (setf token-id chosen)
-              (when (= token-id bos) (return))
-              (push (aref uchars token-id) sample)))
-          (format t "sample ~2d: ~{~a~}~%" (1+ sample-idx) (reverse sample)))))))
+    (when save-path
+      (save-state-table state-table save-path)
+      (format t "Saved weights to ~a~%" save-path))
+    state-table))
+
+(defun infer (state-table uchars bos n-layer n-head head-dim block-size
+              &key (temperature 0.5) (num-samples 20))
+  (format t "~%--- inference (new, hallucinated names) ---~%")
+  (dotimes (sample-idx num-samples)
+    (let ((keys (make-array n-layer :initial-element '()))
+          (vals (make-array n-layer :initial-element '()))
+          (token-id bos)
+          (sample '()))
+      (dotimes (pos-id block-size)
+        (let* ((logits (gpt token-id pos-id keys vals state-table n-layer n-head head-dim))
+               (scaled (mapcar (lambda (l) (value-div l (make-value temperature))) logits))
+               (probs (softmax scaled))
+               (weights (mapcar #'data probs))
+               (r (* (random 1.0) (reduce #'+ weights)))
+               (chosen (loop for w in weights
+                             for idx from 0
+                             summing w into cumul
+                             when (>= cumul r) return idx)))
+          (setf token-id chosen)
+          (when (= token-id bos) (return))
+          (push (aref uchars token-id) sample)))
+      (format t "sample ~2d: ~{~a~}~%" (1+ sample-idx) (reverse sample)))))
+
+(defun main ()
+  (let* ((names (let ((n (shuffle (load-names))))
+                  (format t "Names: ~a~%" (length n))
+                  n))
+         (uchars (sort (unique-chars names) #'char<))
+         (bos (length uchars))
+         (vocab-size (+ bos 1))
+         (n-embd 16)
+         (n-head 4)
+         (n-layer 1)
+         (block-size 16)
+         (head-dim (/ n-embd n-head))
+         (weights-path (asdf:system-relative-pathname :microgpt "model.weights"))
+         (state-table (train names uchars bos vocab-size n-embd n-head n-layer block-size head-dim
+                             :save-path weights-path)))
+    (infer state-table uchars bos n-layer n-head head-dim block-size)))
