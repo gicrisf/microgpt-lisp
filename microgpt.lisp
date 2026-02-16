@@ -29,6 +29,25 @@
           collect ch into chars
           finally (return (coerce chars 'vector)))))
 
+;; Box-Muller transform for standard normal (mean 0, std dev 0.08)
+(defun random-gauss (&optional (mean 0.0) (std-dev 0.8))
+  (let ((u1 (random 1.0))
+        (u2 (random 1.0)))
+    (+ mean
+       (* std-dev
+          (sqrt (* -2.0 (log u1)))
+          (cos (* 2.0 pi u2))))))
+
+(defun matrix (nout nin)
+  "Create a matrix of value objects with random gaussian init.
+
+Args:
+  NOUT (integer): Number of output rows.
+  NIN (integer): Number of input columns."
+  (loop for _i from 0 below nout
+        collect (loop for _j from 0 below nin
+                      collect (random-gauss))))
+
 (defun main ()
   (let* ((names (let ((n (shuffle (load-names))))
                   (format t "Names: ~a~%" (length n))
@@ -43,5 +62,29 @@
          ;; total number of unique tokens, +1 is for BOS
          (vocab-size (let ((v (+ bos 1)))
                       (format t "Vocab size: ~a~%" v)
-                      v)))
-    (print "running")))
+                      v))
+         (n-embd 16)  ;; embedding dimension
+         (n-head 4)   ;; number of attention heads
+         (n-layer 1)  ;; number of layers
+         (block-size 16) ;; maximum sequence length
+         (head-dim (/ n-embd n-head)) ;; dimension of each head
+         ;; TODO Implement value
+         (state-table (let ((ht (make-hash-table :test 'equal)))
+                        (setf (gethash "wte" ht) (matrix vocab-size n-embd)
+                              (gethash "wpe" ht) (matrix block-size n-embd)
+                              (gethash "lm_head" ht) (matrix vocab-size n-embd))
+                        (loop for i from 0 below n-layer
+                              do (setf (gethash (format nil "layer~a.attn_wq" i) ht) (matrix n-embd n-embd)
+                                       (gethash (format nil "layer~a.attn_wk" i) ht) (matrix n-embd n-embd)
+                                       (gethash (format nil "layer~a.attn_wv" i) ht) (matrix n-embd n-embd)
+                                       (gethash (format nil "layer~a.attn_wo" i) ht) (matrix n-embd n-embd)
+                                       (gethash (format nil "layer~a.mlp_fc1" i) ht) (matrix (* 4 n-embd) n-embd)
+                                       (gethash (format nil "layer~a.mlp_fc2" i) ht) (matrix n-embd (* 4 n-embd))))
+                        ht)))
+    ;; Debug print of the state table
+    (maphash (lambda (k v)
+               (format t "~a (~a x ~a):~%" k (length v) (length (first v)))
+               (loop for row in (subseq v 0 (min 3 (length v)))
+                     do (format t "  ~{~,4f ~}~%" (subseq row 0 (min 5 (length row)))))
+               (format t "  ...~%"))
+             state-table)))
