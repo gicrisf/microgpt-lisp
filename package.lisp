@@ -1,4 +1,5 @@
 ;;;; package.lisp
 
 (defpackage #:microgpt
-  (:use #:cl))
+  (:use #:cl)
+  (:export #:main))
