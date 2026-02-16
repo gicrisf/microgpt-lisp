@@ -196,8 +196,8 @@ Args:
          (bos (length uchars))
          ;; total number of unique tokens, +1 is for BOS
          (vocab-size (let ((v (+ bos 1)))
-                      (format t "Vocab size: ~a~%" v)
-                      v))
+                       (format t "Vocab size: ~a~%" v)
+                       v))
          (n-embd 16)  ;; embedding dimension
          (n-head 4)   ;; number of attention heads
          (n-layer 1)  ;; number of layers
@@ -238,9 +238,9 @@ Args:
       ;; Take single document, tokenize it, surround with BOS on both sides
       (let* ((doc (aref names (mod step (length names))))
              (tokens (concatenate 'vector
-                       (vector bos)
-                       (map 'vector (lambda (ch) (position ch uchars)) doc)
-                       (vector bos)))
+                                  (vector bos)
+                                  (map 'vector (lambda (ch) (position ch uchars)) doc)
+                                  (vector bos)))
              (n (min block-size (1- (length tokens))))
              ;; Fresh KV cache per document
              (keys (make-array n-layer :initial-element '()))
@@ -269,4 +269,26 @@ Args:
                            (v-hat (/ (aref v i) (- 1 (expt beta2 (1+ step))))))
                        (decf (data p) (* lr-t (/ m-hat (+ (expt v-hat 0.5) eps-adam)))))
                      (setf (grad p) 0)))
-          (format t "step ~4d / ~4d | loss ~,4f~%" (1+ step) num-steps (data loss)))))))
+          (format t "step ~4d / ~4d | loss ~,4f~%" (1+ step) num-steps (data loss)))))
+    ;; Inference: may the model babble back to us
+    (let ((temperature 0.5))
+      (format t "~%--- inference (new, hallucinated names) ---~%")
+      (dotimes (sample-idx 20)
+        (let ((keys (make-array n-layer :initial-element '()))
+              (vals (make-array n-layer :initial-element '()))
+              (token-id bos)
+              (sample '()))
+          (dotimes (pos-id block-size)
+            (let* ((logits (gpt token-id pos-id keys vals state-table n-layer n-head head-dim))
+                   (scaled (mapcar (lambda (l) (value-div l (make-value temperature))) logits))
+                   (probs (softmax scaled))
+                   (weights (mapcar #'data probs))
+                   (r (* (random 1.0) (reduce #'+ weights)))
+                   (chosen (loop for w in weights
+                                 for idx from 0
+                                 summing w into cumul
+                                 when (>= cumul r) return idx)))
+              (setf token-id chosen)
+              (when (= token-id bos) (return))
+              (push (aref uchars token-id) sample)))
+          (format t "sample ~2d: ~{~a~}~%" (1+ sample-idx) (reverse sample)))))))
