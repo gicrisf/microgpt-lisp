@@ -19,6 +19,29 @@
         do (rotatef (aref vec i) (aref vec (random (1+ i)))))
   vec)
 
+(defun unique-chars (names)
+  "Return a vector of unique characters found across all strings in NAMES."
+  (let ((seen (make-hash-table)))
+    (loop for name across names
+          do (loop for ch across name
+                   do (setf (gethash ch seen) t)))
+    (loop for ch being the hash-keys of seen
+          collect ch into chars
+          finally (return (coerce chars 'vector)))))
+
 (defun main ()
-  (let ((names (shuffle (load-names))))
-    (format t "~a~%" (length names))))
+  (let* ((names (let ((n (shuffle (load-names))))
+                  (format t "Names: ~a~%" (length n))
+                  n))
+         ;; Let there be a Tokenizer
+         ;; to translate strings to discrete symbols and back
+         ;;
+         ;; unique characters in the dataset become token ids 0..n-1
+         (uchars (sort (unique-chars names) #'char<))
+         ;; token id for the special Beginning of Sequence (BOS) token
+         (bos (length uchars))
+         ;; total number of unique tokens, +1 is for BOS
+         (vocab-size (let ((v (+ bos 1)))
+                      (format t "Vocab size: ~a~%" v)
+                      v)))
+    (print "running")))
